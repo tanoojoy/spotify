@@ -147,7 +147,7 @@ async function getNowPlayingPayload() {
     const explicit = !!item.explicit;
     const trackUrl = item.external_urls?.spotify || "";
     const coverUrl = item.album?.images?.[0]?.url || "";
-    const imageUrl = await urlToDataUri(coverUrl);
+    const imageUrl = isPlaying ? await urlToDataUri(coverUrl) : await urlToDataUri(false);
     const durationMs = item.duration_ms ?? 0;
 
     const progressMsRaw = data.progress_ms ?? 0;
@@ -363,7 +363,7 @@ app.get("/now-playing.svg", async (req, res) => {
                 ...payload,
                 title: "Not using Spotify",
                 album: "*cricket noises*",
-                imageUrl: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAGswJ/lk8mOQAAAABJRU5ErkJggg==",
+                imageUrl: "https://raw.githubusercontent.com/tanoojoy/tanoojoy/refs/heads/main/sleepybara.png",
                 progressMs: 0,
                 durationMs: 0,
                 remainingMs: 0,
