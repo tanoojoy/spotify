@@ -94,6 +94,20 @@ function msToClock(ms = 0) {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+async function urlToDataUri(url) {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`image fetch ${res.status}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    const contentType = res.headers.get("content-type") || "image/jpeg";
+    const base64 = buf.toString("base64");
+    return `data:${contentType};base64,${base64}`;
+  } catch (_) {
+    return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAGswJ/lk8mOQAAAABJRU5ErkJggg==";
+  }
+}
+
+
 function renderSVG({ title, album, imageUrl, progressMs, durationMs, isPlaying, animate = true }) {
   const width = 500, height = 120, padding = 16;
   const barWidth = width - 140;
@@ -140,23 +154,25 @@ async function getNowPlayingPayload() {
 
   const { access_token } = await getAccessTokenViaRefreshToken(SPOTIFY_REFRESH_TOKEN);
   const data = await fetchCurrentlyPlaying(access_token);
-
   if (!data || !data.item) return { isPlaying: false };
 
   const isPlaying = Boolean(data.is_playing);
   const item = data.item;
+
   const title = item.name || "";
   const album = item.album?.name || "";
-  const imageUrl = item.album?.images?.[0]?.url || "";
+  const coverUrl = item.album?.images?.[0]?.url || "";
+  const imageUrl = await urlToDataUri(coverUrl);
   const durationMs = item.duration_ms ?? 0;
 
-  const progressMs = (data.progress_ms ?? 0);
+  const progressMs = data.progress_ms ?? 0;
   const spotifyTs = data.timestamp ?? Date.now();
   const now = Date.now();
   const progressAtRender = Math.min(durationMs, Math.max(0, progressMs + (now - spotifyTs)));
 
   return { isPlaying, title, album, imageUrl, durationMs, progressMs: progressAtRender };
 }
+
 
 
 app.get("/login", (req, res) => {
@@ -185,7 +201,9 @@ app.get("/callback", async (req, res) => {
 app.get("/now-playing.json", async (req, res) => {
   try {
     const payload = await getNowPlayingPayload();
-    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    console.log(payload)
+    res.setHeader("Content-Type", "image/svg+xml; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=0, s-maxage=0, must-revalidate");
     res.setHeader("Pragma", "no-cache");
     res.setHeader("Expires", "0");
     res.json(payload);
