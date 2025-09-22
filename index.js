@@ -363,7 +363,7 @@ app.get("/now-playing.svg", async (req, res) => {
                 ...payload,
                 title: "Not using Spotify",
                 album: "*cricket noises*",
-                imageUrl: "https://raw.githubusercontent.com/tanoojoy/tanoojoy/refs/heads/main/sleepybara.png",
+                imageUrl: await urlToDataUri("https://raw.githubusercontent.com/tanoojoy/tanoojoy/refs/heads/main/sleepybara.png"),
                 progressMs: 0,
                 durationMs: 0,
                 remainingMs: 0,
