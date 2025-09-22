@@ -43,9 +43,7 @@ async function exchangeCodeForTokens(code) {
     body,
   });
 
-  if (!res.ok) {
-    throw new Error(`Token exchange failed: ${res.status} ${await res.text()}`);
-  }
+  if (!res.ok) throw new Error(`Token exchange failed: ${res.status} ${await res.text()}`);
   return res.json();
 }
 
@@ -64,10 +62,8 @@ async function getAccessTokenViaRefreshToken(refreshToken) {
     body,
   });
 
-  if (!res.ok) {
-    throw new Error(`Refresh token failed: ${res.status} ${await res.text()}`);
-  }
-  return res.json(); 
+  if (!res.ok) throw new Error(`Refresh token failed: ${res.status} ${await res.text()}`);
+  return res.json();
 }
 
 async function fetchCurrentlyPlaying(accessToken) {
@@ -75,7 +71,7 @@ async function fetchCurrentlyPlaying(accessToken) {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
 
-  if (res.status === 204) return null; 
+  if (res.status === 204) return null;
   if (res.status === 200) return res.json();
 
   const txt = await res.text();
@@ -90,16 +86,27 @@ function esc(text = "") {
     .replace(/"/g, "&quot;");
 }
 
-function renderSVG({ title, album, imageUrl, progressMs, durationMs, isPlaying }) {
-  const width = 500;
-  const height = 120;
-  const padding = 16;
+function msToClock(ms = 0) {
+  if (!ms || ms < 0) ms = 0;
+  const totalSec = Math.floor(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function renderSVG({ title, album, imageUrl, progressMs, durationMs, isPlaying, animate = true }) {
+  const width = 500, height = 120, padding = 16;
+  const barWidth = width - 140;
 
   const pct = durationMs > 0 ? Math.max(0, Math.min(1, progressMs / durationMs)) : 0;
-  const barWidth = width - 140; 
   const filled = Math.round(barWidth * pct);
-
+  const remainingMs = Math.max(0, durationMs - progressMs);
   const statusText = isPlaying ? "Now Playing" : "Not Playing";
+
+  const animateTag =
+    isPlaying && animate && remainingMs > 0
+      ? `<animate attributeName="width" from="${filled}" to="${barWidth}" dur="${(remainingMs/1000).toFixed(2)}s" fill="freeze" />`
+      : "";
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="${esc(statusText)}: ${esc(title)}">
@@ -109,32 +116,48 @@ function renderSVG({ title, album, imageUrl, progressMs, durationMs, isPlaying }
     .muted { fill: #8b949e; font-weight: 500; }
   </style>
   <rect class="card" x="0.5" y="0.5" rx="12" ry="12" width="${width-1}" height="${height-1}" stroke-width="1"/>
-  
-  <!-- Album Art -->
-  <image href="${esc(imageUrl)}" x="${padding}" y="${padding}" width="88" height="88" clip-path="url(#round)"/>
-  <defs>
-    <clipPath id="round"><rect x="${padding}" y="${padding}" width="88" height="88" rx="8" ry="8"/></clipPath>
-  </defs>
 
-  <!-- Text -->
+  <image href="${esc(imageUrl)}" x="${padding}" y="${padding}" width="88" height="88" clip-path="url(#round)"/>
+  <defs><clipPath id="round"><rect x="${padding}" y="${padding}" width="88" height="88" rx="8" ry="8"/></clipPath></defs>
+
   <text class="text" x="${padding + 88 + 16}" y="${padding + 8}" font-size="12">${esc(statusText)}</text>
   <text class="text" x="${padding + 88 + 16}" y="${padding + 32}" font-size="18">${esc(title || "—")}</text>
   <text class="text muted" x="${padding + 88 + 16}" y="${padding + 56}" font-size="14">${esc(album || "—")}</text>
 
-  <!-- Progress -->
   <rect x="${padding + 88 + 16}" y="${padding + 72}" width="${barWidth}" height="8" fill="#30363d" rx="4" ry="4"/>
-  <rect x="${padding + 88 + 16}" y="${padding + 72}" width="${filled}" height="8" fill="#1db954" rx="4" ry="4"/>
+  <rect x="${padding + 88 + 16}" y="${padding + 72}" width="${filled}" height="8" fill="#1db954" rx="4" ry="4">
+    ${animateTag}
+  </rect>
+
   <text class="text muted" x="${padding + 88 + 16}" y="${padding + 96}" font-size="12">${msToClock(progressMs)} / ${msToClock(durationMs)}</text>
 </svg>`;
 }
 
-function msToClock(ms = 0) {
-  if (!ms || ms < 0) ms = 0;
-  const totalSec = Math.floor(ms / 1000);
-  const m = Math.floor(totalSec / 60);
-  const s = totalSec % 60;
-  return `${m}:${s.toString().padStart(2, "0")}`;
+async function getNowPlayingPayload() {
+  if (!SPOTIFY_REFRESH_TOKEN) {
+    return { error: "Missing SPOTIFY_REFRESH_TOKEN. Hit /login and set it in .env." };
+  }
+
+  const { access_token } = await getAccessTokenViaRefreshToken(SPOTIFY_REFRESH_TOKEN);
+  const data = await fetchCurrentlyPlaying(access_token);
+
+  if (!data || !data.item) return { isPlaying: false };
+
+  const isPlaying = Boolean(data.is_playing);
+  const item = data.item;
+  const title = item.name || "";
+  const album = item.album?.name || "";
+  const imageUrl = item.album?.images?.[0]?.url || "";
+  const durationMs = item.duration_ms ?? 0;
+
+  const progressMs = (data.progress_ms ?? 0);
+  const spotifyTs = data.timestamp ?? Date.now();
+  const now = Date.now();
+  const progressAtRender = Math.min(durationMs, Math.max(0, progressMs + (now - spotifyTs)));
+
+  return { isPlaying, title, album, imageUrl, durationMs, progressMs: progressAtRender };
 }
+
 
 app.get("/login", (req, res) => {
   const params = new URLSearchParams({
@@ -150,45 +173,14 @@ app.get("/callback", async (req, res) => {
   try {
     const code = req.query.code;
     if (!code) return res.status(400).send("Missing ?code");
-
     const tokens = await exchangeCodeForTokens(code);
     const refresh = tokens.refresh_token;
-    if (!refresh) {
-      return res.status(500).send("No refresh_token returned. Ensure you requested correct scopes.");
-    }
-
-    res.send(`
-      <h2>Copy your Refresh Token</h2>
-      <pre style="white-space:pre-wrap;word-break:break-all;">${refresh}</pre>
-      <p>Put this in your .env as <code>SPOTIFY_REFRESH_TOKEN</code> and restart the server.</p>
-    `);
+    if (!refresh) return res.status(500).send("No refresh_token returned. Check scopes.");
+    res.send(`<h2>Copy your Refresh Token</h2><pre style="white-space:pre-wrap;word-break:break-all;">${refresh}</pre>`);
   } catch (e) {
     res.status(500).send(String(e));
   }
 });
-
-async function getNowPlayingPayload() {
-  if (!SPOTIFY_REFRESH_TOKEN) {
-    return { error: "Missing SPOTIFY_REFRESH_TOKEN. Hit /login and set it in .env." };
-  }
-
-  const { access_token } = await getAccessTokenViaRefreshToken(SPOTIFY_REFRESH_TOKEN);
-  const data = await fetchCurrentlyPlaying(access_token);
-
-  if (!data || !data.item) {
-    return { isPlaying: false };
-  }
-
-  const isPlaying = Boolean(data.is_playing);
-  const item = data.item;
-  const title = item.name || "";
-  const album = item.album?.name || "";
-  const imageUrl = item.album?.images?.[0]?.url || "";
-  const durationMs = item.duration_ms ?? 0;
-  const progressMs = data.progress_ms ?? 0;
-
-  return { isPlaying, title, album, imageUrl, durationMs, progressMs };
-}
 
 app.get("/now-playing.json", async (req, res) => {
   try {
@@ -215,6 +207,7 @@ app.get("/now-playing.svg", async (req, res) => {
         progressMs: 0,
         durationMs: 0,
         isPlaying: false,
+        animate: false,
       });
     } else if (!payload.isPlaying) {
       svg = renderSVG({
@@ -224,9 +217,10 @@ app.get("/now-playing.svg", async (req, res) => {
         progressMs: 0,
         durationMs: 0,
         isPlaying: false,
+        animate: false,
       });
     } else {
-      svg = renderSVG(payload);
+      svg = renderSVG({ ...payload, isPlaying: true, animate: true });
     }
 
     res.setHeader("Content-Type", "image/svg+xml");
@@ -235,7 +229,6 @@ app.get("/now-playing.svg", async (req, res) => {
     res.setHeader("Expires", "0");
     res.send(svg);
   } catch (e) {
-
     const err = esc(String(e));
     const svg = `<?xml version="1.0" encoding="UTF-8"?>
 <svg width="500" height="80" viewBox="0 0 500 80" xmlns="http://www.w3.org/2000/svg">
@@ -254,9 +247,8 @@ app.get("/", (req, res) => {
     <ul>
       <li><a href="/login">/login</a> – authorize and get your refresh token</li>
       <li><a href="/now-playing.json">/now-playing.json</a> – raw data</li>
-      <li><a href="/now-playing.svg">/now-playing.svg</a> – embeddable card</li>
+      <li><a href="/now-playing.svg">/now-playing.svg</a> – animated card</li>
     </ul>
-    <p>Set <code>APP_BASE_URL</code> in .env to your deployed URL for production.</p>
   `);
 });
 
