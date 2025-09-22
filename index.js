@@ -1,275 +1,382 @@
-import express from "express";
-import dotenv from "dotenv";
+const express = require("express");
+const dotenv = require("dotenv");
+const crypto = require("crypto");
 
 dotenv.config();
 
 const {
-  PORT = 3000,
-  APP_BASE_URL,
-  SPOTIFY_CLIENT_ID,
-  SPOTIFY_CLIENT_SECRET,
-  SPOTIFY_REFRESH_TOKEN,
+    PORT = 3000,
+    APP_BASE_URL,
+    SPOTIFY_CLIENT_ID,
+    SPOTIFY_CLIENT_SECRET,
+    SPOTIFY_REFRESH_TOKEN,
 } = process.env;
 
 if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET || !APP_BASE_URL) {
-  console.error("Missing env vars. Check SPOTIFY_CLIENT_ID/SECRET and APP_BASE_URL.");
-  process.exit(1);
+    console.error("Missing env vars. Check SPOTIFY_CLIENT_ID/SECRET and APP_BASE_URL.");
+    process.exit(1);
 }
 
 const app = express();
 
-const SCOPES = [
-  "user-read-currently-playing",
-  "user-read-playback-state",
-].join(" ");
+const SCOPES = ["user-read-currently-playing", "user-read-playback-state"].join(" ");
+const COVER_CACHE_TTL_MS = 10 * 60 * 1000;
+const coverCache = new Map();
 
 function toBasicAuth(id, secret) {
-  return Buffer.from(`${id}:${secret}`).toString("base64");
+    return Buffer.from(`${id}:${secret}`).toString("base64");
 }
 
 async function exchangeCodeForTokens(code) {
-  const body = new URLSearchParams({
-    grant_type: "authorization_code",
-    code,
-    redirect_uri: `${APP_BASE_URL}/callback`,
-  });
+    const body = new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: `${APP_BASE_URL}/callback`,
+    });
 
-  const res = await fetch("https://accounts.spotify.com/api/token", {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${toBasicAuth(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body,
-  });
+    const res = await fetch("https://accounts.spotify.com/api/token", {
+        method: "POST",
+        headers: {
+            Authorization: `Basic ${toBasicAuth(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)}`,
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body,
+    });
 
-  if (!res.ok) throw new Error(`Token exchange failed: ${res.status} ${await res.text()}`);
-  return res.json();
+    if (!res.ok) throw new Error(`Token exchange failed: ${res.status} ${await res.text()}`);
+    return res.json();
 }
 
 async function getAccessTokenViaRefreshToken(refreshToken) {
-  const body = new URLSearchParams({
-    grant_type: "refresh_token",
-    refresh_token: refreshToken,
-  });
+    const body = new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+    });
 
-  const res = await fetch("https://accounts.spotify.com/api/token", {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${toBasicAuth(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body,
-  });
+    const res = await fetch("https://accounts.spotify.com/api/token", {
+        method: "POST",
+        headers: {
+            Authorization: `Basic ${toBasicAuth(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)}`,
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body,
+    });
 
-  if (!res.ok) throw new Error(`Refresh token failed: ${res.status} ${await res.text()}`);
-  return res.json();
+    if (!res.ok) throw new Error(`Refresh token failed: ${res.status} ${await res.text()}`);
+    return res.json();
 }
 
 async function fetchCurrentlyPlaying(accessToken) {
-  const res = await fetch("https://api.spotify.com/v1/me/player/currently-playing?additional_types=track,episode", {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
+    const res = await fetch("https://api.spotify.com/v1/me/player/currently-playing?additional_types=track,episode", {
+        headers: { Authorization: `Bearer ${accessToken}` },
+    });
 
-  if (res.status === 204) return null;
-  if (res.status === 200) return res.json();
+    if (res.status === 204) return null;
+    if (res.status === 200) return res.json();
 
-  const txt = await res.text();
-  throw new Error(`Spotify API error ${res.status}: ${txt}`);
+    const txt = await res.text();
+    throw new Error(`Spotify API error ${res.status}: ${txt}`);
 }
 
 function esc(text = "") {
-  return String(text)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    return String(text)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
 }
 
 function msToClock(ms = 0) {
-  if (!ms || ms < 0) ms = 0;
-  const totalSec = Math.floor(ms / 1000);
-  const m = Math.floor(totalSec / 60);
-  const s = totalSec % 60;
-  return `${m}:${s.toString().padStart(2, "0")}`;
+    if (!ms || ms < 0) ms = 0;
+    const totalSec = Math.floor(ms / 1000);
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function cacheGet(url) {
+    const v = coverCache.get(url);
+    if (!v) return null;
+    if (Date.now() - v.t > COVER_CACHE_TTL_MS) {
+        coverCache.delete(url);
+        return null;
+    }
+    return v.dataUri;
+}
+function cacheSet(url, dataUri) {
+    coverCache.set(url, { dataUri, t: Date.now() });
 }
 
 async function urlToDataUri(url) {
-  try {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`image fetch ${res.status}`);
-    const buf = Buffer.from(await res.arrayBuffer());
-    const contentType = res.headers.get("content-type") || "image/jpeg";
-    const base64 = buf.toString("base64");
-    return `data:${contentType};base64,${base64}`;
-  } catch (_) {
-    return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAGswJ/lk8mOQAAAABJRU5ErkJggg==";
-  }
-}
+    if (!url) {
+        return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAGswJ/lk8mOQAAAABJRU5ErkJggg==";
+    }
+    const cached = cacheGet(url);
+    if (cached) return cached;
 
-
-function renderSVG({ title, album, imageUrl, progressMs, durationMs, isPlaying, animate = true }) {
-  const width = 500, height = 120, padding = 16;
-  const barWidth = width - 140;
-
-  const pct = durationMs > 0 ? Math.max(0, Math.min(1, progressMs / durationMs)) : 0;
-  const filled = Math.round(barWidth * pct);
-  const remainingMs = Math.max(0, durationMs - progressMs);
-  const statusText = isPlaying ? "Now Playing" : "Not Playing";
-
-  const animateTag =
-    isPlaying && animate && remainingMs > 0
-      ? `<animate attributeName="width" from="${filled}" to="${barWidth}" dur="${(remainingMs/1000).toFixed(2)}s" fill="freeze" />`
-      : "";
-
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="${esc(statusText)}: ${esc(title)}">
-  <style>
-    .card { fill: #0d1117; stroke: #30363d; }
-    .text { font: 600 14px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif; fill: #c9d1d9; }
-    .muted { fill: #8b949e; font-weight: 500; }
-  </style>
-  <rect class="card" x="0.5" y="0.5" rx="12" ry="12" width="${width-1}" height="${height-1}" stroke-width="1"/>
-
-  <image href="${esc(imageUrl)}" x="${padding}" y="${padding}" width="88" height="88" clip-path="url(#round)"/>
-  <defs><clipPath id="round"><rect x="${padding}" y="${padding}" width="88" height="88" rx="8" ry="8"/></clipPath></defs>
-
-  <text class="text" x="${padding + 88 + 16}" y="${padding + 8}" font-size="12">${esc(statusText)}</text>
-  <text class="text" x="${padding + 88 + 16}" y="${padding + 32}" font-size="18">${esc(title || "—")}</text>
-  <text class="text muted" x="${padding + 88 + 16}" y="${padding + 56}" font-size="14">${esc(album || "—")}</text>
-
-  <rect x="${padding + 88 + 16}" y="${padding + 72}" width="${barWidth}" height="8" fill="#30363d" rx="4" ry="4"/>
-  <rect x="${padding + 88 + 16}" y="${padding + 72}" width="${filled}" height="8" fill="#1db954" rx="4" ry="4">
-    ${animateTag}
-  </rect>
-
-  <text class="text muted" x="${padding + 88 + 16}" y="${padding + 96}" font-size="12">${msToClock(progressMs)} / ${msToClock(durationMs)}</text>
-</svg>`;
+    try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`image fetch ${res.status}`);
+        const buf = Buffer.from(await res.arrayBuffer());
+        const contentType = res.headers.get("content-type") || "image/jpeg";
+        const base64 = buf.toString("base64");
+        const dataUri = `data:${contentType};base64,${base64}`;
+        cacheSet(url, dataUri);
+        return dataUri;
+    } catch {
+        return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAGswJ/lk8mOQAAAABJRU5ErkJggg==";
+    }
 }
 
 async function getNowPlayingPayload() {
-  if (!SPOTIFY_REFRESH_TOKEN) {
-    return { error: "Missing SPOTIFY_REFRESH_TOKEN. Hit /login and set it in .env." };
-  }
+    if (!SPOTIFY_REFRESH_TOKEN) {
+        return { error: "Missing SPOTIFY_REFRESH_TOKEN. Hit /login and set it in .env." };
+    }
 
-  const { access_token } = await getAccessTokenViaRefreshToken(SPOTIFY_REFRESH_TOKEN);
-  const data = await fetchCurrentlyPlaying(access_token);
-  if (!data || !data.item) return { isPlaying: false };
+    const { access_token } = await getAccessTokenViaRefreshToken(SPOTIFY_REFRESH_TOKEN);
+    const data = await fetchCurrentlyPlaying(access_token);
 
-  const isPlaying = Boolean(data.is_playing);
-  const item = data.item;
+    if (!data || !data.item) return { isPlaying: false };
 
-  const title = item.name || "";
-  const album = item.album?.name || "";
-  const coverUrl = item.album?.images?.[0]?.url || "";
-  const imageUrl = await urlToDataUri(coverUrl);
-  const durationMs = item.duration_ms ?? 0;
+    const isPlaying = Boolean(data.is_playing);
+    const item = data.item;
 
-  const progressMs = data.progress_ms ?? 0;
-  const spotifyTs = data.timestamp ?? Date.now();
-  const now = Date.now();
-  const progressAtRender = Math.min(durationMs, Math.max(0, progressMs + (now - spotifyTs)));
+    const title = item.name || "";
+    const album = item.album?.name || "";
+    const artists = (item.artists || []).map(a => a.name);
+    const explicit = !!item.explicit;
+    const trackUrl = item.external_urls?.spotify || "";
+    const coverUrl = item.album?.images?.[0]?.url || "";
+    const imageUrl = await urlToDataUri(coverUrl);
+    const durationMs = item.duration_ms ?? 0;
 
-  return { isPlaying, title, album, imageUrl, durationMs, progressMs: progressAtRender };
+    const progressMsRaw = data.progress_ms ?? 0;
+    const spotifyTs = data.timestamp ?? Date.now();
+    const now = Date.now();
+    const clockSkew = Math.abs(now - spotifyTs);
+    const correction = clockSkew < 2000 ? (now - spotifyTs) : 0;
+    const progressAtRender = Math.min(durationMs, Math.max(0, progressMsRaw + correction));
+    const remainingMs = Math.max(0, durationMs - progressAtRender);
+
+    return {
+        isPlaying,
+        title,
+        album,
+        artists,
+        explicit,
+        trackUrl,
+        imageUrl,
+        durationMs,
+        progressMs: progressAtRender,
+        remainingMs,
+        accent: "#1db954",
+    };
 }
 
+function renderSVG(opts) {
+    const {
+        title = "—",
+        album = "—",
+        artists = [],
+        explicit = false,
+        trackUrl = "",
+        imageUrl,
+        progressMs = 0,
+        durationMs = 0,
+        remainingMs = 0,
+        isPlaying = false,
+        accent = "#1db954",
+        theme = "dark",
+        size = "wide",
+    } = opts;
 
+
+    const isCompact = size === "compact";
+    const r = 16;
+    const padding = 16;
+
+    const artSize = isCompact ? 180 : 200;
+    const height = artSize;
+    const leftW = artSize;
+    const txtX = leftW + padding;
+    const width = leftW + 320;
+    const contentW = width - txtX - padding;
+
+    const colors = theme === "light" ? {
+        card: "#ffffff",
+        stroke: "#e5e7eb",
+        text: "#0f172a",
+        muted: "#475569",
+        barBg: "#e5e7eb",
+        backdropOpacity: 0.08
+    } : {
+        card: "#0d1117",
+        stroke: "#30363d",
+        text: "#c9d1d9",
+        muted: "#8b949e",
+        barBg: "#30363d",
+        backdropOpacity: 0.18
+    };
+
+    const artistsText = (artists || []).join(", ");
+    const pct = durationMs > 0 ? Math.max(0, Math.min(1, progressMs / durationMs)) : 0;
+    const filled = Math.round(contentW * pct);
+    const animateTag = (isPlaying && remainingMs > 500 && filled <= contentW)
+        ? `<animate attributeName="width"
+                from="${filled}" to="${contentW}"
+                dur="${(remainingMs / 1000).toFixed(2)}s"
+                calcMode="linear" fill="freeze" />`
+        : "";
+
+    const linkOpen = trackUrl ? `<a xlink:href="${esc(trackUrl)}" target="_blank" rel="noopener noreferrer">` : "";
+    const linkClose = trackUrl ? `</a>` : "";
+
+    // Animated EQ bars under the title (only while playing)
+    const eqY = padding + (isCompact ? 60 : 70);
+    const eqW = 4, eqGap = 4, eqCount = 7;
+    const eq = isPlaying ? `
+    <g transform="translate(${txtX}, ${eqY})">
+      ${Array.from({ length: eqCount }).map((_, i) => `
+        <rect x="${i * (eqW + eqGap)}" y="0" width="${eqW}" height="14" fill="${accent}">
+          <animate attributeName="height" values="5;18;9;20;7;14;5" dur="${(1 + i * 0.12).toFixed(2)}s" repeatCount="indefinite"/>
+          <animate attributeName="y"      values="9;0;6;0;7;2;9"   dur="${(1 + i * 0.12).toFixed(2)}s" repeatCount="indefinite"/>
+        </rect>
+      `).join("")}
+    </g>
+  ` : "";
+
+    const eBadge = explicit ? `
+    <g transform="translate(${txtX - 24}, ${padding + 2})">
+      <rect width="18" height="18" rx="4" ry="4" fill="#e11d48"></rect>
+      <text x="9" y="13" text-anchor="middle" font-size="12" fill="#fff" font-family="Segoe UI, Helvetica, Arial, sans-serif">E</text>
+    </g>` : "";
+
+
+    const labelY = padding + 14;
+    const titleY = padding + (isCompact ? 36 : 40);
+    const artistY = padding + (isCompact ? 56 : 60);
+    const barY = height - padding - 30;
+    const timeY = height - padding - 8;
+
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"
+     xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     role="img" aria-label="${esc(isPlaying ? "Now Playing" : "Not Playing")}: ${esc(title)}">
+  <defs>
+    <clipPath id="cardClip">
+      <rect x="0.5" y="0.5" width="${width - 1}" height="${height - 1}" rx="${r}" ry="${r}" />
+    </clipPath>
+    <filter id="blur" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="24"/>
+    </filter>
+  </defs>
+
+  <g clip-path="url(#cardClip)">
+    <image href="${esc(imageUrl)}" x="0" y="-60" width="${width}" height="${height + 120}"
+           preserveAspectRatio="xMidYMid slice" filter="url(#blur)" opacity="${colors.backdropOpacity}"/>
+  </g>
+
+  <rect x="0.5" y="0.5" width="${width - 1}" height="${height - 1}" rx="${r}" ry="${r}"
+        fill="${colors.card}" stroke="${colors.stroke}"/>
+
+  ${linkOpen}
+    <!-- LEFT: full-bleed album art (clipped to the card) -->
+    <g clip-path="url(#cardClip)">
+      <image href="${esc(imageUrl)}" x="0" y="0" width="${leftW}" height="${height}"
+             preserveAspectRatio="xMidYMid slice"/>
+    </g>
+
+    ${eBadge}
+    <text x="${txtX}" y="${labelY}" font-size="12" font-weight="600"
+          fill="${colors.muted}" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+      ${esc(isPlaying ? "Now Playing" : "Not Playing")}
+    </text>
+
+    <text x="${txtX}" y="${titleY}" font-size="${isCompact ? 18 : 20}" font-weight="700"
+          fill="${colors.text}" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+      <title>${esc(title)}</title>${esc(title || "—")}
+    </text>
+
+    <text x="${txtX}" y="${artistY}" font-size="${isCompact ? 14 : 15}" font-weight="600"
+          fill="${colors.muted}" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+      <title>${esc(artistsText || album || "—")}</title>${esc(artistsText || album || "—")}
+    </text>
+  ${linkClose}
+
+  ${eq}
+
+  <rect x="${txtX}" y="${barY}" width="${contentW}" height="10" fill="${colors.barBg}" rx="5" ry="5"/>
+  <rect x="${txtX}" y="${barY}" width="${filled}" height="10" fill="${accent}" rx="5" ry="5">
+    ${animateTag}
+  </rect>
+
+  <text x="${txtX}" y="${timeY}" font-size="12" fill="${colors.muted}" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+    ${msToClock(progressMs)} / ${msToClock(durationMs)}
+  </text>
+</svg>`;
+}
 
 app.get("/login", (req, res) => {
-  const params = new URLSearchParams({
-    client_id: SPOTIFY_CLIENT_ID,
-    response_type: "code",
-    redirect_uri: `${APP_BASE_URL}/callback`,
-    scope: SCOPES,
-  });
-  res.redirect(`https://accounts.spotify.com/authorize?${params.toString()}`);
+    const params = new URLSearchParams({
+        client_id: SPOTIFY_CLIENT_ID,
+        response_type: "code",
+        redirect_uri: `${APP_BASE_URL}/callback`,
+        scope: SCOPES,
+    });
+    res.redirect(`https://accounts.spotify.com/authorize?${params.toString()}`);
 });
 
 app.get("/callback", async (req, res) => {
-  try {
-    const code = req.query.code;
-    if (!code) return res.status(400).send("Missing ?code");
-    const tokens = await exchangeCodeForTokens(code);
-    const refresh = tokens.refresh_token;
-    if (!refresh) return res.status(500).send("No refresh_token returned. Check scopes.");
-    res.send(`<h2>Copy your Refresh Token</h2><pre style="white-space:pre-wrap;word-break:break-all;">${refresh}</pre>`);
-  } catch (e) {
-    res.status(500).send(String(e));
-  }
+    try {
+        const code = req.query.code;
+        if (!code) return res.status(400).send("Missing ?code");
+        const tokens = await exchangeCodeForTokens(code);
+        const refresh = tokens.refresh_token;
+        if (!refresh) return res.status(500).send("No refresh_token returned. Check scopes.");
+        res.send(`<h2>Copy your Refresh Token</h2><pre>${refresh}</pre>`);
+    } catch (e) {
+        res.status(500).send(String(e));
+    }
 });
 
 app.get("/now-playing.json", async (req, res) => {
-  try {
-    const payload = await getNowPlayingPayload();
-    console.log(payload)
-    res.setHeader("Content-Type", "image/svg+xml; charset=utf-8");
-    res.setHeader("Cache-Control", "public, max-age=0, s-maxage=0, must-revalidate");
-    res.setHeader("Pragma", "no-cache");
-    res.setHeader("Expires", "0");
-    res.json(payload);
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
+    try {
+        const payload = await getNowPlayingPayload();
+        res.setHeader("Cache-Control", "no-cache");
+        res.json(payload);
+    } catch (e) {
+        res.status(500).json({ error: String(e) });
+    }
 });
 
 app.get("/now-playing.svg", async (req, res) => {
-  try {
-    const payload = await getNowPlayingPayload();
+    try {
+        const theme = (req.query.theme || "dark").toLowerCase();
+        const size = (req.query.size || "wide").toLowerCase();
+        const payload = await getNowPlayingPayload();
+        const svg = renderSVG({ ...payload, theme, size });
 
-    let svg;
-    if (payload.error) {
-      svg = renderSVG({
-        title: "Setup required",
-        album: payload.error,
-        imageUrl: "https://upload.wikimedia.org/wikipedia/commons/8/84/Spotify_icon.svg",
-        progressMs: 0,
-        durationMs: 0,
-        isPlaying: false,
-        animate: false,
-      });
-    } else if (!payload.isPlaying) {
-      svg = renderSVG({
-        title: "Nothing playing",
-        album: "Spotify",
-        imageUrl: "https://upload.wikimedia.org/wikipedia/commons/8/84/Spotify_icon.svg",
-        progressMs: 0,
-        durationMs: 0,
-        isPlaying: false,
-        animate: false,
-      });
-    } else {
-      svg = renderSVG({ ...payload, isPlaying: true, animate: true });
+        const etag = `"${crypto.createHash("sha1").update(svg).digest("hex")}"`;
+        if (req.headers["if-none-match"] === etag) return res.status(304).end();
+
+        res.setHeader("Content-Type", "image/svg+xml; charset=utf-8");
+        res.setHeader("Cache-Control", "public, max-age=0, s-maxage=0, must-revalidate");
+        res.setHeader("ETag", etag);
+        res.send(svg);
+    } catch (e) {
+        res.setHeader("Content-Type", "image/svg+xml; charset=utf-8");
+        res.status(200).send(`<svg width="500" height="80" xmlns="http://www.w3.org/2000/svg"><text x="10" y="40" fill="red">${esc(String(e))}</text></svg>`);
     }
-
-    res.setHeader("Content-Type", "image/svg+xml");
-    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-    res.setHeader("Pragma", "no-cache");
-    res.setHeader("Expires", "0");
-    res.send(svg);
-  } catch (e) {
-    const err = esc(String(e));
-    const svg = `<?xml version="1.0" encoding="UTF-8"?>
-<svg width="500" height="80" viewBox="0 0 500 80" xmlns="http://www.w3.org/2000/svg">
-  <rect x="0.5" y="0.5" rx="12" ry="12" width="499" height="79" fill="#0d1117" stroke="#30363d"/>
-  <text x="16" y="48" fill="#e5534b" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14">Error: ${err}</text>
-</svg>`;
-    res.setHeader("Content-Type", "image/svg+xml");
-    res.setHeader("Cache-Control", "no-cache");
-    res.status(200).send(svg);
-  }
 });
 
 app.get("/", (req, res) => {
-  res.type("html").send(`
-    <h1>Spotify Now Playing</h1>
-    <ul>
-      <li><a href="/login">/login</a> – authorize and get your refresh token</li>
-      <li><a href="/now-playing.json">/now-playing.json</a> – raw data</li>
-      <li><a href="/now-playing.svg">/now-playing.svg</a> – animated card</li>
-    </ul>
-  `);
+    res.send(`<h1>Spotify Now Playing</h1><ul>
+    <li><a href="/login">/login</a></li>
+    <li><a href="/now-playing.json">/now-playing.json</a></li>
+    <li><a href="/now-playing.svg">/now-playing.svg</a></li>
+  </ul>`);
 });
 
 app.listen(PORT, () => {
-  console.log(`Listening on http://localhost:${PORT}`);
+    console.log(`Listening on ${APP_BASE_URL || `http://localhost:${PORT}`}`);
 });
