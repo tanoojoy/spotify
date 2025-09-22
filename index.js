@@ -109,7 +109,7 @@ function cacheSet(url, dataUri) {
 
 async function urlToDataUri(url) {
     if (!url) {
-        return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAGswJ/lk8mOQAAAABJRU5ErkJggg==";
+        return "https://raw.githubusercontent.com/tanoojoy/tanoojoy/refs/heads/main/sleepybara.png";
     }
     const cached = cacheGet(url);
     if (cached) return cached;
