@@ -188,6 +188,7 @@ function renderSVG(opts) {
         accent = "#1db954",
         theme = "dark",
         size = "wide",
+        statusLabel,
     } = opts;
 
 
@@ -201,6 +202,7 @@ function renderSVG(opts) {
     const txtX = leftW + padding;
     const width = leftW + 320;
     const contentW = width - txtX - padding;
+    const labelText = statusLabel || (isPlaying ? "Now Playing" : "Not Playing");
 
     const colors = theme === "light" ? {
         card: "#ffffff",
@@ -218,7 +220,8 @@ function renderSVG(opts) {
         backdropOpacity: 0.18
     };
 
-    const artistsText = (artists || []).join(", ");
+    let artistsText = (artists || []).join(", ");
+    isPlaying ? null : artistsText = "*cricket noises*";
     const pct = durationMs > 0 ? Math.max(0, Math.min(1, progressMs / durationMs)) : 0;
     const filled = Math.round(contentW * pct);
     const animateTag = (isPlaying && remainingMs > 500 && filled <= contentW)
@@ -230,8 +233,6 @@ function renderSVG(opts) {
 
     const linkOpen = trackUrl ? `<a xlink:href="${esc(trackUrl)}" target="_blank" rel="noopener noreferrer">` : "";
     const linkClose = trackUrl ? `</a>` : "";
-
-    // Animated EQ bars under the title (only while playing)
     const eqY = padding + (isCompact ? 60 : 70);
     const eqW = 4, eqGap = 4, eqCount = 7;
     const eq = isPlaying ? `
@@ -261,7 +262,7 @@ function renderSVG(opts) {
     return `<?xml version="1.0" encoding="UTF-8"?>
 <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"
      xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
-     role="img" aria-label="${esc(isPlaying ? "Now Playing" : "Not Playing")}: ${esc(title)}">
+     role="img" aria-label="${esc(labelText)}: ${esc(title)}">
   <defs>
     <clipPath id="cardClip">
       <rect x="0.5" y="0.5" width="${width - 1}" height="${height - 1}" rx="${r}" ry="${r}" />
@@ -280,7 +281,6 @@ function renderSVG(opts) {
         fill="${colors.card}" stroke="${colors.stroke}"/>
 
   ${linkOpen}
-    <!-- LEFT: full-bleed album art (clipped to the card) -->
     <g clip-path="url(#cardClip)">
       <image href="${esc(imageUrl)}" x="0" y="0" width="${leftW}" height="${height}"
              preserveAspectRatio="xMidYMid slice"/>
@@ -342,6 +342,9 @@ app.get("/callback", async (req, res) => {
 app.get("/now-playing.json", async (req, res) => {
     try {
         const payload = await getNowPlayingPayload();
+        if (!payload.isPlaying) {
+            return res.json({ isPlaying: false, status: "Not using Spotify" });
+        }
         res.setHeader("Cache-Control", "no-cache");
         res.json(payload);
     } catch (e) {
@@ -354,7 +357,22 @@ app.get("/now-playing.svg", async (req, res) => {
         const theme = (req.query.theme || "dark").toLowerCase();
         const size = (req.query.size || "wide").toLowerCase();
         const payload = await getNowPlayingPayload();
-        const svg = renderSVG({ ...payload, theme, size });
+        let svg;
+        if (!payload.isPlaying) {
+            svg = renderSVG({
+                ...payload,
+                title: "Not using Spotify",
+                album: "*cricket noises*",
+                imageUrl: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAGswJ/lk8mOQAAAABJRU5ErkJggg==",
+                progressMs: 0,
+                durationMs: 0,
+                remainingMs: 0,
+                statusLabel: "Not using Spotify",
+                theme, size,
+            });
+        } else {
+            svg = renderSVG({ ...payload, theme, size });
+        }
 
         const etag = `"${crypto.createHash("sha1").update(svg).digest("hex")}"`;
         if (req.headers["if-none-match"] === etag) return res.status(304).end();
